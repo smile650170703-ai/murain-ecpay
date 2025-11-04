@@ -1,0 +1,155 @@
+*** Begin Patch
+*** Add File: src/services/ecpay.js
++// src/services/ecpay.js
++// ECPay helper: 計算 CheckMacValue，並呼叫開立發票 API
++// ESM module: export async function issueInvoiceForOrder(env, ord, items)
++
++function md5(str) {
++  // simple md5 implementation adapted for Node/browser usage
++  // (small, self-contained implementation - works for our CheckMacValue use)
++  // Note: for Node you can replace with require('crypto').createHash('md5')...
++  let k = [], i = 0;
++  for (; i < 64;) k[i] = 0 | (Math.abs(Math.sin(++i)) * 4294967296);
++  let a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
++  const s = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
++  function toBytes(str) {
++    const encoder = new TextEncoder();
++    return new Uint8Array(encoder.encode(String(str || '')));
++  }
++  const msg = toBytes(str);
++  const msgLenBits = msg.length * 8;
++  const withPadding = new Uint8Array(((msg.length + 8) >> 6 << 4) + 16);
++  withPadding.set(msg);
++  withPadding[msg.length] = 0x80;
++  for (let i = 0; i < 8; i++) {
++    withPadding[withPadding.length - 8 + i] = (msgLenBits >>> (8 * i)) & 0xFF;
++  }
++  const M = new Uint32Array(withPadding.buffer);
++  for (let i_block = 0; i_block < M.length; i_block += 16) {
++    let A = a, B = b, C = c, D = d;
++    for (let j = 0; j < 64; j++) {
++      let F, g;
++      if (j < 16) { F = (B & C) | ((~B) & D); g = j; }
++      else if (j < 32) { F = (D & B) | ((~D) & C); g = (5*j + 1) % 16; }
++      else if (j < 48) { F = B ^ C ^ D; g = (3*j + 5) % 16; }
++      else { F = C ^ (B | (~D)); g = (7*j) % 16; }
++      const tmp = (A + F + k[j] + M[i_block + g]) | 0;
++      A = D; D = C; C = B;
++      const shift = s[j];
++      B = (B + ((tmp << shift) | (tmp >>> (32 - shift)))) | 0;
++    }
++    a = (a + A) | 0; b = (b + B) | 0; c = (c + C) | 0; d = (d + D) | 0;
++  }
++  function toHex(n) {
++    let s = '';
++    for (let i = 0; i < 4; i++) s += ('0' + ((n >>> (i*8)) & 0xFF).toString(16)).slice(-2);
++    return s;
++  }
++  return toHex(a) + toHex(b) + toHex(c) + toHex(d);
++}
++
++function encodeForECPay(s) {
++  return encodeURIComponent(s)
++    .replace(/%20/g, '+')
++    .replace(/%21/g, '!')
++    .replace(/%27/g, "'")
++    .replace(/%28/g, '(')
++    .replace(/%29/g, ')')
++    .replace(/%2A/g, '*');
++}
++
++export async function ecpayCMV(paramsObj, hashKey, hashIV) {
++  let checkString = `HashKey=${hashKey}`;
++  const keys = Object.keys(paramsObj).sort();
++  for (const key of keys) {
++    checkString += `&${key}=${paramsObj[key]}`;
++  }
++  checkString += `&HashIV=${hashIV}`;
++  let encoded = encodeForECPay(checkString);
++  encoded = encoded.toLowerCase();
++  const hash = md5(encoded).toUpperCase();
++  return hash;
++}
++
++function safeStr(v) { return v == null ? '' : String(v); }
++
++export async function issueInvoiceForOrder(env, ord, items) {
++  // env: provide ECPAY_MERCHANT_ID / ECPAY_HASH_KEY / ECPAY_HASH_IV / ECPAY_USE_LIVE / ECPAY_INVOICE_API_URL / ECPAY_INVOICE_API_URL_TEST
++  const MID = env.ECPAY_MERCHANT_ID;
++  const HKey = env.ECPAY_HASH_KEY;
++  const HIV  = env.ECPAY_HASH_IV;
++  if (!MID || !HKey || !HIV) {
++    throw new Error('ECPay env variables missing (ECPAY_MERCHANT_ID / ECPAY_HASH_KEY / ECPAY_HASH_IV)');
++  }
++  const ecpayItems = (items || []).map(item => ({
++    ItemName: safeStr(item.name || item.ItemName).slice(0,50),
++    ItemCount: Math.max(1, Number(item.qty || item.ItemCount || 1)),
++    ItemUnit: item.unit || '個',
++    ItemPrice: Math.round(Number(item.unit_price_final || item.ItemPrice || 0)),
++    ItemAmt: Math.round(Number(item.subtotal || item.ItemAmt || 0)),
++    ItemTaxType: item.ItemTaxType || '1'
++  }));
++  const itemTotal = ecpayItems.reduce((s,i)=>s + (i.ItemAmt||0), 0);
++  const salesAmount = Math.round(Number(ord.total_amount || ord.salesAmount || itemTotal || 0));
++  if (itemTotal !== salesAmount) {
++    // Allow small difference? For safety, throw to prevent bad invoices
++    throw new Error(`Invoice item total (${itemTotal}) does not match order total (${salesAmount})`);
++  }
++
++  const now = Math.floor(Date.now() / 1000);
++  const shippingInfo = (() => {
++    try { return JSON.parse(ord.shipping_info || ord.shippingInfo || '{}'); } catch(e) { return {}; }
++  })();
++
++  const postData = {
++    MerchantID: MID,
++    RelateNumber: safeStr(ord.order_id || ord.relateNumber || ('REL' + (ord.id || Date.now()))),
++    CustomerID: '',
++    CustomerIdentifier: '',
++    CustomerName: safeStr(shippingInfo.name || ord.customer_name || ord.customerName || '客戶'),
++    CustomerAddr: safeStr(shippingInfo.address || ord.customer_addr || ord.customerAddr || '地址'),
++    CustomerPhone: safeStr(shippingInfo.phone || ord.customer_phone || ord.customerPhone || '0912345678'),
++    CustomerEmail: safeStr(shippingInfo.email || ord.customer_email || ord.customerEmail || 'guest@murain.tw'),
++    ClearanceMark: '',
++    Print: '0',
++    Donation: '0',
++    LoveCode: '',
++    CarruerType: '',
++    CarruerNum: '',
++    TaxType: '1',
++    SalesAmount: String(salesAmount),
++    InvoiceRemark: safeStr(ord.gift_notes || ord.note || ''),
++    ItemName: ecpayItems.map(i=>i.ItemName).join('|'),
++    ItemCount: ecpayItems.map(i=>i.ItemCount).join('|'),
++    ItemUnit: ecpayItems.map(i=>i.ItemUnit).join('|'),
++    ItemPrice: ecpayItems.map(i=>i.ItemPrice).join('|'),
++    ItemAmt: ecpayItems.map(i=>i.ItemAmt).join('|'),
++    ItemTaxType: ecpayItems.map(i=>i.ItemTaxType).join('|'),
++    InvType: '07',
++    vat: '',
++    TimeStamp: String(now)
++  };
++
++  // Compute CheckMacValue
++  const sortedParams = Object.fromEntries(Object.entries(postData).sort());
++  const cmv = await ecpayCMV(sortedParams, HKey, HIV);
++  const finalPayload = { ...postData, CheckMacValue: cmv };
++  const body = new URLSearchParams(finalPayload).toString();
++
++  const useLive = String(env.ECPAY_USE_LIVE || '').toLowerCase() === '1';
++  const ecpayUrl = useLive ? (env.ECPAY_INVOICE_API_URL || 'https://einvoice.ecpay.com.tw/InvService/Invoice/Issue') : (env.ECPAY_INVOICE_API_URL_TEST || 'https://einvoice-stage.ecpay.com.tw/InvService/Invoice/Issue');
++
++  const res = await fetch(ecpayUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
++  const text = await res.text();
++  const result = Object.fromEntries(new URLSearchParams(text));
++
++  // Normalize result keys
++  const RtnCode = result.RtnCode || result.Rtn || result.RtnCode;
++  if (String(RtnCode) === '1' || Number(RtnCode) === 1) {
++    return { ok: true, RtnCode: '1', data: result, InvoiceNumber: result.InvoiceNumber || result.InvoiceNo || result.Invoice || '' };
++  } else {
++    return { ok: false, RtnCode: RtnCode, error: result.RtnMsg || JSON.stringify(result), data: result };
++  }
++}
++
+*** End Patch
